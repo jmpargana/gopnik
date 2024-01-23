@@ -1,37 +1,77 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"sync"
+	"time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/schollz/progressbar/v3"
+
+	"github.com/3th1nk/cidr"
+	"github.com/tevino/tcp-shaker"
 	"golang.org/x/net/proxy"
 )
-
-type PortScanner struct{}
-
-func (ps *PortScanner) Dial(network, address string) (net.Conn, error) {
-	return net.Dial(network, address)
-}
 
 var (
 	MAX_PORT = 65536
 	host     = flag.String("host", "scanme.nmap.org", "host to scan")
 	port     = flag.Int("port", 443, "port to scan")
+	checker  = tcp.NewChecker()
 )
 
-func ScanPort(dialer proxy.Dialer, host string, port int) (int, bool) {
-	addr := fmt.Sprintf("%s:%d", host, port)
+type PortScanner struct{}
 
-	// TODO: use ip4:tcp not to complete tcp handshake
-	// This will imply sending SYN packet and listening fot SYN+ACK or RST to validate
-	conn, err := dialer.Dial("tcp", addr)
+func (ps *PortScanner) Dial(network, address string) (net.Conn, error) {
+	timeout := time.Second * 1
+	_, client := net.Pipe()
+	err := checker.CheckAddr(address, timeout)
+	return client, err
+	// This is a fake implemention in non-Linux platforms
+	// return net.DialTimeout(network, address, timeout)
+}
+
+func ScanPort(d proxy.Dialer, host string, port int) bool {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	conn, err := d.Dial("tcp", addr)
 	if err != nil {
-		return port, false
+		return false
 	}
 	conn.Close()
-	return port, true
+	return true
+}
+
+func buildSYNPacket(dstIP net.IP, dstPort int) []byte {
+	buf := gopacket.NewSerializeBuffer()
+
+	opts := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+
+	tcpLayer := &layers.TCP{
+		SrcPort: layers.TCPPort(12345), // Use a random source port
+		DstPort: layers.TCPPort(dstPort),
+		SYN:     true,
+	}
+
+	ipLayer := &layers.IPv4{
+		SrcIP:    net.IPv4(127, 0, 0, 1), // Use a dummy source IP address
+		DstIP:    dstIP,
+		Protocol: layers.IPProtocolTCP,
+	}
+
+	err := gopacket.SerializeLayers(buf, opts, ipLayer, tcpLayer)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return buf.Bytes()
 }
 
 func VanillaScan(d proxy.Dialer, host string) []int {
@@ -39,15 +79,16 @@ func VanillaScan(d proxy.Dialer, host string) []int {
 	ch := make(chan int)
 	availablePorts := []int{}
 
-	// TODO: add progress bar
+	bar := progressbar.Default(int64(MAX_PORT), "Vanilla scanning ports 1..65536")
 	for i := 1; i < MAX_PORT; i++ {
 		wg.Add(1)
-		go func(wg *sync.WaitGroup, ch chan int, port int) {
-			if p, ok := ScanPort(d, host, port); ok {
-				ch <- p
+		go func(wg *sync.WaitGroup, ch chan int, port int, b *progressbar.ProgressBar) {
+			if ok := ScanPort(d, host, port); ok {
+				ch <- port
 			}
 			wg.Done()
-		}(wg, ch, i)
+			b.Add(1)
+		}(wg, ch, i, bar)
 	}
 	go func() {
 		wg.Wait()
@@ -79,9 +120,27 @@ Open ports:
 func main() {
 	flag.Parse()
 
-	// TODO: host parse input
+	ctx, stopChecker := context.WithCancel(context.Background())
+	defer stopChecker()
+	go func() {
+		if err := checker.CheckingLoop(ctx); err != nil {
+			fmt.Println("checking loop stopped due to fatal error: ", err)
+		}
+	}()
 
-	ports := VanillaScan(&PortScanner{}, *host)
-	s := PrintAllowedPorts(*host, ports)
-	fmt.Println(s)
+	<-checker.WaitReady()
+
+	c, err := cidr.Parse(*host)
+	if err != nil {
+		panic(err)
+	}
+	// TODO: parallelize per IP also
+	c.Each(func(ip string) bool {
+		fmt.Printf("Host IP: %s\n", ip)
+		ports := VanillaScan(&PortScanner{}, ip)
+		s := PrintAllowedPorts(ip, ports)
+		fmt.Println(s)
+		fmt.Printf("Number of ports open: %d\n", len(ports))
+		return true
+	})
 }
